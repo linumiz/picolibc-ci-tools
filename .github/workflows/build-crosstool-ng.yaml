@@ -6,9 +6,25 @@ on:
       - main
     tags:
       - '*'
+    paths:
+      - '.github/workflows/build-crosstool-ng.yaml'
+      - 'configs/crosstool-ng/**'
+      - 'patches/binutils/**'
+      - 'patches/crosstool-ng/**'
+      - 'patches/gcc/**'
+      - 'patches/gdb/**'
+      - 'scripts/merge_config.sh'
   pull_request:
     branches:
       - main
+    paths:
+      - '.github/workflows/build-crosstool-ng.yaml'
+      - 'configs/crosstool-ng/**'
+      - 'patches/binutils/**'
+      - 'patches/crosstool-ng/**'
+      - 'patches/gcc/**'
+      - 'patches/gdb/**'
+      - 'scripts/merge_config.sh'
   workflow_dispatch:
 
 # When a PR is updated, cancel the jobs from the previous version. Merges
