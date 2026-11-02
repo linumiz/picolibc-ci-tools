@@ -1,0 +1,165 @@
+From e8f1439f188015be1341c0ee30e98d5f9224acfd Mon Sep 17 00:00:00 2001
+From: Keith Packard <keithp@keithp.com>
+Date: Sun, 1 Nov 2026 21:34:14 -0800
+Subject: [PATCH] lm32: Align the stack to 64 bits
+
+lm32 aligns long long and double to 8 bytes (BIGGEST_ALIGNMENT is 64),
+but STACK_BOUNDARY was 32. Without stack realignment support,
+MAX_SUPPORTED_STACK_ALIGNMENT is then 32, and assign_stack_local caps
+every stack slot at 4-byte alignment. Local variables survive this
+because cfgexpand realigns large-alignment variables at run time, but
+the home slot of a by-value parameter whose address is taken comes
+from assign_parm_setup_stack, which calls assign_stack_local and gets a
+4-byte-aligned slot. For example
+
+    extern void g(long long *);
+    void param(int a, long long p) { g(&p); }
+
+passes g a pointer that is 4 mod 8 in a 12-byte frame. UBSan reports
+these accesses (type_mismatch, load_of/store_to off_t and double) in
+picolibc's fopencookie_seek and cospi/sinpi/tanpi on lm32.
+
+Set STACK_BOUNDARY to 64. This also requires:
+
+ - rounding the frame size to STACK_BOUNDARY instead of 4 bytes in
+   lm32_compute_frame_size;
+
+ - setting the frame pointer in the prologue to total_size -
+   pretend_size above sp, which matches the ARG_POINTER_REGNUM to
+   STACK_POINTER_REGNUM elimination offset now that the frame may
+   contain padding;
+
+ - padding the varargs pretend area to a multiple of 8 below the saved
+   argument registers, so that the frame pointer (pretend_size below
+   the incoming arguments) stays aligned, and skipping that padding in
+   va_start.
+
+This is an ABI change: lm32 code now assumes sp is 8-byte aligned at
+function entry and keeps it 8-byte aligned at calls. The layout of
+arguments passed on the stack and in registers, and of the varargs
+register save area relative to the incoming arguments, is unchanged.
+Code built by an older compiler can still call or be called by new
+code, but an old caller may enter new code with sp only 4-byte
+aligned, and 8-byte stack objects in the new code are then misaligned
+exactly as before. Everything, including libgcc, should be rebuilt.
+
+A complete fix that keeps the old 4-byte stack alignment would need
+generic changes to parameter setup in function.cc, for example giving
+large-alignment parameter home slots the same run-time realignment
+that expand_stack_vars gives local variables.
+
+lm32 appears to be the only GCC 14.2 target with a fixed STACK_BOUNDARY
+below BIGGEST_ALIGNMENT and no stack realignment support. Other targets
+either limit BIGGEST_ALIGNMENT to 32 (or1k, rx, nios2, microblaze,
+arc, ...), tie STACK_BOUNDARY to BIGGEST_ALIGNMENT (sh, v850, pa, arm
+with ARM_DOUBLEWORD_ALIGN, mcore with TARGET_8ALIGN), or support stack
+realignment (i386).
+
+Signed-off-by: Keith Packard <keithp@keithp.com>
+---
+ gcc/config/lm32/lm32.cc | 34 +++++++++++++++++++++++++++-------
+ gcc/config/lm32/lm32.h  |  2 +-
+ 2 files changed, 28 insertions(+), 8 deletions(-)
+
+diff --git a/gcc/config/lm32/lm32.cc b/gcc/config/lm32/lm32.cc
+index 9435f8c73..e71bc45c4 100644
+--- a/gcc/config/lm32/lm32.cc
++++ b/gcc/config/lm32/lm32.cc
+@@ -411,11 +411,10 @@ lm32_expand_prologue (void)
+ 
+ 	  /* Add offset - Don't use total_size, as that includes pretend_size, 
+              which isn't part of this frame?  */
+-	  insn = emit_add (frame_pointer_rtx, 
++	  insn = emit_add (frame_pointer_rtx,
+ 			   frame_pointer_rtx,
+-			   GEN_INT (current_frame_info.args_size +
+-				    current_frame_info.callee_size +
+-				    current_frame_info.locals_size));
++			   GEN_INT (current_frame_info.total_size -
++				    current_frame_info.pretend_size));
+ 	  RTX_FRAME_RELATED_P (insn) = 1;
+ 	}
+ 
+@@ -495,7 +494,8 @@ lm32_compute_frame_size (int size)
+   total_size = pretend_size + args_size + locals_size + callee_size;
+ 
+   /* Align frame to appropriate boundary.  */
+-  total_size = (total_size + 3) & ~3;
++  total_size = ((total_size + STACK_BOUNDARY / BITS_PER_UNIT - 1)
++		& ~(STACK_BOUNDARY / BITS_PER_UNIT - 1));
+ 
+   /* Save computed information.  */
+   current_frame_info.total_size = total_size;
+@@ -690,6 +690,10 @@ lm32_compute_initial_elimination_offset (int from, int to)
+   return offset;
+ }
+ 
++/* Bytes of padding below the saved anonymous argument registers in
++   the current function's pretend area.  */
++static int lm32_varargs_pad;
++
+ static void
+ lm32_setup_incoming_varargs (cumulative_args_t cum_v,
+ 			     const function_arg_info &arg,
+@@ -721,20 +725,31 @@ lm32_setup_incoming_varargs (cumulative_args_t cum_v,
+ 	((size + UNITS_PER_WORD - 1) / UNITS_PER_WORD);
+     }
+ 
++  lm32_varargs_pad = 0;
++
+   if (FUNCTION_ARG_REGNO_P (first_anon_arg))
+     {
+       int size = LM32_FIRST_ARG_REG + LM32_NUM_ARG_REGS - first_anon_arg;
++      int bytes = size * UNITS_PER_WORD;
++      int boundary = STACK_BOUNDARY / BITS_PER_UNIT;
++
++      /* The frame pointer is pretend_size below the incoming
++	 arguments, so pad the pretend area to keep the frame aligned
++	 to STACK_BOUNDARY. The pad goes below the saved registers,
++	 which must stay next to the arguments passed on the stack.  */
++      lm32_varargs_pad = (boundary - bytes % boundary) % boundary;
+ 
+       if (!no_rtl)
+ 	{
+ 	  rtx regblock
+ 	    = gen_rtx_MEM (BLKmode,
+ 			   plus_constant (Pmode, arg_pointer_rtx,
+-					  FIRST_PARM_OFFSET (0)));
++					  FIRST_PARM_OFFSET (0)
++					  + lm32_varargs_pad));
+ 	  move_block_from_reg (first_anon_arg, regblock, size);
+ 	}
+ 
+-      *pretend_size = size * UNITS_PER_WORD;
++      *pretend_size = bytes + lm32_varargs_pad;
+     }
+ }
+ /* This is the "struct __va_list".  */
+@@ -808,6 +823,11 @@ lm32_builtin_va_start (tree valist, rtx nextarg)
+   ap = build3 (COMPONENT_REF, TREE_TYPE (ap_field), valist,
+ 	       ap_field, NULL_TREE);
+ 
++  /* Skip the padding below the saved registers, added by
++     lm32_setup_incoming_varargs to keep the frame aligned.  */
++  if (lm32_varargs_pad)
++    nextarg = plus_constant (Pmode, nextarg, lm32_varargs_pad);
++
+   std_expand_builtin_va_start (ap, nextarg);
+ 
+   ap_reg_field = DECL_CHAIN(ap_field);
+diff --git a/gcc/config/lm32/lm32.h b/gcc/config/lm32/lm32.h
+index 1d2c8adad..d0c5b51fd 100644
+--- a/gcc/config/lm32/lm32.h
++++ b/gcc/config/lm32/lm32.h
+@@ -87,7 +87,7 @@ do {                                                    \
+ 
+ #define PARM_BOUNDARY 32
+ 
+-#define STACK_BOUNDARY 32
++#define STACK_BOUNDARY 64
+ 
+ #define BIGGEST_ALIGNMENT 64
+ 
+-- 
+2.47.3
+
